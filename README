@@ -1,0 +1,10 @@
+install requirements.txt
+
+run both benchmark.py and benchmark_protein.py
+This produces the training data for our model.
+
+run create_model.py
+This trains the MLP.
+
+run predict_mag.py
+This generates a prediction for the mag dataset with the MLP model.
