@@ -1,0 +1,19 @@
+torch==2.0.1+cu118
+torchvision==0.15.2+cu118
+torchaudio==2.0.2+cu118
+numpy<2.0
+torch-scatter; extra_index_url=https://data.pyg.org/whl/torch-2.0.1+cu118.html
+torch-sparse; extra_index_url=https://data.pyg.org/whl/torch-2.0.1+cu118.html
+torch-cluster; extra_index_url=https://data.pyg.org/whl/torch-2.0.1+cu118.html
+torch-spline-conv; extra_index_url=https://data.pyg.org/whl/torch-2.0.1+cu118.html
+torch-geometric
+networkx
+scikit-learn
+matplotlib
+psutil
+sympy==1.13.1
+seaborn
+pandas
+python-louvain
+powerlaw
+ogb

@@ -8,3 +8,9 @@ This trains the MLP.
 
 run predict_mag.py
 This generates a prediction for the mag dataset with the MLP model.
+
+run mag_actual.py
+This outputs the actual training distributions for the mag dataset
+
+You can run this for additional visualizations
+plot_performances.py

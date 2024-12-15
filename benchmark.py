@@ -6,38 +6,33 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, SAGEConv, TransformerConv, GATConv, Node2Vec
-from torch_geometric.loader import NeighborLoader, DataLoader
+from torch_geometric.loader import NeighborLoader
 from ogb.nodeproppred import PygNodePropPredDataset, Evaluator
 from sklearn.metrics import f1_score, accuracy_score
 import numpy as np
 import logging
-import psutil
 import pandas as pd
 import time
+
 import gc
 import argparse
 import random
-from tqdm import tqdm  # For progress bars
+from tqdm import tqdm
 
-# -----------------------------
-# Section 0: Setup Logging
-# -----------------------------
 logging.basicConfig(
     filename='benchmark_log.txt',
-    filemode='w',
+    filemode='a',  # Append mode
     format='%(asctime)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
-# models
 
 class GCNModel(nn.Module):
     def __init__(self, in_feats, hidden_feats, out_feats, num_layers=2):
         super(GCNModel, self).__init__()
         self.convs = nn.ModuleList()
         self.convs.append(GCNConv(in_feats, hidden_feats))
-        for _ in range(num_layers - 2):
+        for _ in range(num_layers-2):
             self.convs.append(GCNConv(hidden_feats, hidden_feats))
         self.convs.append(GCNConv(hidden_feats, out_feats))
 
@@ -57,7 +52,7 @@ class GraphSAGEModel(nn.Module):
             self.convs.append(SAGEConv(hidden_feats, hidden_feats))
         self.convs.append(SAGEConv(hidden_feats, out_feats))
 
-    def forward(self, x,edge_index):
+    def forward(self, x, edge_index):
         for i, conv in enumerate(self.convs):
             x = conv(x, edge_index)
             if i != len(self.convs) - 1:
@@ -73,9 +68,9 @@ class GraphGPSModel(nn.Module):
         self.layers = nn.ModuleList()
         for i in range(num_layers):
             if i % 2 == 0:
-                self.layers.append(GCNConv(hidden_feats, hidden_feats))
-            else:
                 self.layers.append(TransformerConv(hidden_feats, hidden_feats, heads=num_heads, concat=False))
+            else:
+                self.layers.append(GCNConv(hidden_feats, hidden_feats))
         self.linear_out = nn.Linear(hidden_feats, out_feats)
 
     def forward(self, x, edge_index):
@@ -91,18 +86,16 @@ class GATModel(nn.Module):
         super(GATModel, self).__init__()
         if hidden_feats % num_heads != 0:
             raise ValueError("hidden_feats must be divisible by num_heads for GAT.")
-        self.num_layers = num_layers
         self.convs = nn.ModuleList()
-        self.convs.append(GATConv(in_feats, hidden_feats // num_heads, heads=num_heads))
+        self.convs.append(GATConv(in_feats, hidden_feats // num_heads, heads=num_heads, concat=True))
         for _ in range(num_layers - 2):
-            self.convs.append(GATConv(hidden_feats, hidden_feats // num_heads, heads=num_heads))
-        
+            self.convs.append(GATConv(hidden_feats, hidden_feats // num_heads, heads=num_heads, concat=True))
         self.convs.append(GATConv(hidden_feats, out_feats, heads=1, concat=False))
 
     def forward(self, x, edge_index):
         for i, conv in enumerate(self.convs):
             x = conv(x, edge_index)
-            if i < self.num_layers - 1:
+            if i < len(self.convs) - 1:
                 x = F.relu(x)
         return x
 
@@ -128,7 +121,6 @@ def load_model(model_name, in_feats, out_feats, dataset_name, num_layers=3):
     else:
         raise ValueError(f"Unknown model {model_name}")
 
-
 def set_seed(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -148,7 +140,7 @@ def evaluate_multiclass(model, loader, device):
     f1_scores = []
     for batch in tqdm(loader, desc="Evaluating", leave=False):
         batch = batch.to(device)
-        out = model(batch.x, batch.edge_index )
+        out = model(batch.x, batch.edge_index)
         preds = out.argmax(dim=-1).cpu()
         targets = batch.y.squeeze(-1).cpu()
         correct += (preds == targets).sum().item()
@@ -176,7 +168,6 @@ def train_multiclass(model, loader, optimizer, device):
             print(f"  [Train Step {step}] Loss: {loss.item():.4f}")
     return total_loss / len(loader)
 
-
 def run_experiment(model_name, dataset_name, device, epochs=10, batch_size=1024, num_neighbors=[15, 10], hidden_dim=32, num_layers=3, num_heads=2):
     logger.info(f"Starting Experiment: Model={model_name}, Dataset={dataset_name}")
     print(f"\n=== Experiment: Model={model_name}, Dataset={dataset_name} ===")
@@ -192,14 +183,13 @@ def run_experiment(model_name, dataset_name, device, epochs=10, batch_size=1024,
         print(f"Failed to load dataset {dataset_name}: {e}")
         return []
     
-    # Get splits
     split_idx = dataset.get_idx_split()
     train_idx = split_idx['train'].squeeze()
     valid_idx = split_idx['valid'].squeeze()
     test_idx = split_idx['test'].squeeze()
     data = data.to('cpu')
     
-    # going to use node2vec
+    # node2vec if neccessary (only for proteins)
     if not hasattr(data, 'x') or data.x is None:
         logger.info("No node features found. Generating Node2Vec embeddings.")
         print("No node features found. Generating Node2Vec embeddings.")
@@ -210,8 +200,9 @@ def run_experiment(model_name, dataset_name, device, epochs=10, batch_size=1024,
     
     evaluator = Evaluator(name=dataset_name)
     
+    # output feats
     try:
-        if dataset_name in ['ogbn-arxiv', 'ogbn-products']:
+        if dataset_name in ['ogbn-arxiv','ogbn-products']:
             out_feats = int(data.y.max()) + 1
         else:
             raise ValueError(f"Unsupported dataset {dataset_name}")
@@ -224,7 +215,10 @@ def run_experiment(model_name, dataset_name, device, epochs=10, batch_size=1024,
         logger.error(f"Failed to initialize model {model_name}: {e}")
         print(f"Failed to initialize model {model_name}: {e}")
         return []
-    # need to use neighborloader because huge data
+    
+    optimizer = optim.Adam(model.parameters(), lr=0.01)
+    
+    # training loader
     train_loader = NeighborLoader(
         data,
         input_nodes=train_idx,
@@ -233,14 +227,20 @@ def run_experiment(model_name, dataset_name, device, epochs=10, batch_size=1024,
         shuffle=True
     )
     
-    valid_loader = DataLoader(
-        torch.arange(valid_idx.size(0)),
+    # validation loader
+    valid_loader = NeighborLoader(
+        data,
+        input_nodes=valid_idx,
+        num_neighbors=[-1],
         batch_size=batch_size,
         shuffle=False
     )
     
-    test_loader = DataLoader(
-        torch.arange(test_idx.size(0)),
+    # neighborloader
+    test_loader = NeighborLoader(
+        data,
+        input_nodes=test_idx,
+        num_neighbors=[-1],  
         batch_size=batch_size,
         shuffle=False
     )
@@ -257,12 +257,12 @@ def run_experiment(model_name, dataset_name, device, epochs=10, batch_size=1024,
         logger.info(f"Epoch {epoch}: Loss={loss:.4f}, Time={epoch_time:.2f}s")
         print(f"Epoch {epoch}: Loss={loss:.4f}, Time={epoch_time:.2f}s")
         
-        # validation
+        # Validation
         val_acc, val_f1 = evaluate_multiclass(model, valid_loader, device)
         logger.info(f"Epoch {epoch}: Validation Accuracy={val_acc:.4f}, Validation F1 (Macro)={val_f1:.4f}")
         print(f"Epoch {epoch}: Validation Accuracy={val_acc:.4f}, Validation F1 (Macro)={val_f1:.4f}")
         
-        # test
+        # Test
         test_acc, test_f1 = evaluate_multiclass(model, test_loader, device)
         logger.info(f"Epoch {epoch}: Test Accuracy={test_acc:.4f}, Test F1 (Macro)={test_f1:.4f}")
         print(f"Epoch {epoch}: Test Accuracy={test_acc:.4f}, Test F1 (Macro)={test_f1:.4f}")
@@ -274,10 +274,10 @@ def run_experiment(model_name, dataset_name, device, epochs=10, batch_size=1024,
             'val_acc': val_acc,
             'val_f1_macro': val_f1,
             'test_acc': test_acc,
-            'test_f1_macro': test_f1
+            'test_f1_macro': test_f1,
+            'val_rocauc': np.nan,  # Not applicable for multi-class
+            'test_rocauc': np.nan  # Not applicable for multi-class
         })
-
-    
     
     logger.info(f"Completed Experiment: Model={model_name}, Dataset={dataset_name}")
     print(f"=== Completed Experiment: Model={model_name}, Dataset={dataset_name} ===")
@@ -310,7 +310,7 @@ def generate_node2vec_features(edge_index, num_nodes, embedding_dim=64, walk_len
     node2vec.eval()
     embeddings = node2vec(torch.arange(num_nodes, device=device)).detach().cpu()
     return embeddings
-
+    
 def main():
     parser = argparse.ArgumentParser(description="Benchmark GNN Models on OGB Datasets")
     parser.add_argument('--models', nargs='+', default=['GCN', 'GraphSAGE', 'GraphGPS', 'GAT'],
@@ -334,7 +334,6 @@ def main():
     args = parser.parse_args()
 
     set_seed(1)
-    # make sur gpu
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     logger.info(f"Using device: {device}")
@@ -342,7 +341,6 @@ def main():
     all_epoch_results = []
     for dataset_name in args.datasets:
         for model_name in args.models:
-            # Adjust epochs for 'ogbn-products'
             current_epochs = args.epochs
             if dataset_name == 'ogbn-products':
                 current_epochs = 2  # Reduced epochs for 'ogbn-products'
@@ -361,10 +359,12 @@ def main():
             if epoch_results:
                 all_epoch_results.extend(epoch_results)
     
-    # save here
     if all_epoch_results:
         results_df = pd.DataFrame(all_epoch_results)
-        desired_columns = ['dataset', 'model', 'epoch', 'val_acc', 'val_f1_macro', 'test_acc', 'test_f1_macro']
+        desired_columns = ['dataset', 'model', 'epoch', 'val_acc', 'val_f1_macro', 'test_acc', 'test_f1_macro', 'val_rocauc', 'test_rocauc']
+        for col in desired_columns:
+            if col not in results_df.columns:
+                results_df[col] = np.nan
         results_df = results_df[desired_columns]
         if not os.path.exists(args.output):
             results_df.to_csv(args.output, index=False)

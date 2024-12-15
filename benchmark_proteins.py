@@ -5,23 +5,28 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch_geometric.nn import Node2Vec,GCNConv,SAGEConv,TransformerConv,GATConv
+from torch_geometric.nn import Node2Vec, GCNConv, SAGEConv, TransformerConv, GATConv
 from torch_geometric.loader import NeighborLoader
 from ogb.nodeproppred import PygNodePropPredDataset, Evaluator
+from sklearn.metrics import f1_score, accuracy_score
 import numpy as np
 import logging
-import psutil
 import pandas as pd
+import time
+import gc
+import argparse
+import random
+from tqdm import tqdm
+
+# Same stuff as benchmark but I did it in a seperate file because it was causing problems
 
 logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    filename='benchmark_log.txt',
+    filemode='a',  # Append mode to retain previous logs
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
-
-# Models
 
 class GCNModel(nn.Module):
     def __init__(self, in_feats, hidden_feats, out_feats, num_layers=2):
@@ -40,7 +45,7 @@ class GCNModel(nn.Module):
         return x
 
 class GraphSAGEModel(nn.Module):
-    def __init__(self, in_feats, hidden_feats, out_feats, num_layers=2 ):
+    def __init__(self, in_feats, hidden_feats, out_feats, num_layers=2):
         super(GraphSAGEModel, self).__init__()
         self.convs = nn.ModuleList()
         self.convs.append(SAGEConv(in_feats, hidden_feats))
@@ -58,6 +63,8 @@ class GraphSAGEModel(nn.Module):
 class GraphGPSModel(nn.Module):
     def __init__(self, in_feats, hidden_feats, out_feats, num_layers=2, num_heads=4):
         super(GraphGPSModel, self).__init__()
+        if hidden_feats % num_heads != 0:
+            raise ValueError("hidden_feats must be divisible by num_heads for GraphGPS.")
         self.linear_in = nn.Linear(in_feats, hidden_feats)
         self.layers = nn.ModuleList()
         for i in range(num_layers):
@@ -65,7 +72,7 @@ class GraphGPSModel(nn.Module):
                 self.layers.append(TransformerConv(hidden_feats, hidden_feats, heads=num_heads, concat=False))
             else:
                 self.layers.append(GCNConv(hidden_feats, hidden_feats))
-        self.linear_out = nn.Linear(hidden_feats,out_feats)
+        self.linear_out = nn.Linear(hidden_feats, out_feats)
 
     def forward(self, x, edge_index):
         x = self.linear_in(x)
@@ -78,54 +85,65 @@ class GraphGPSModel(nn.Module):
 class GATModel(nn.Module):
     def __init__(self, in_feats, hidden_feats, out_feats, num_layers=2, num_heads=4):
         super(GATModel, self).__init__()
-        self.linear_in = nn.Linear(in_feats, hidden_feats)
-        self.layers = nn.ModuleList()
-        for _ in range(num_layers):
-            self.layers.append(GATConv(hidden_feats, hidden_feats // num_heads, heads=num_heads, concat=False))
-        self.linear_out = nn.Linear(hidden_feats, out_feats)
+        if hidden_feats % num_heads != 0:
+            raise ValueError("hidden_feats must be divisible by num_heads for GAT.")
+        self.convs = nn.ModuleList()
+        self.convs.append(GATConv(in_feats, hidden_feats // num_heads, heads=num_heads, concat=True))
+        for _ in range(num_layers - 2):
+            self.convs.append(GATConv(hidden_feats, hidden_feats // num_heads, heads=num_heads, concat=True))
+        self.convs.append(GATConv(hidden_feats, out_feats, heads=1, concat=False))
+
     def forward(self, x, edge_index):
-        x = self.linear_in(x)
-        for conv in self.layers:
+        for i, conv in enumerate(self.convs):
             x = conv(x, edge_index)
-            x = F.relu(x)
-        x = self.linear_out(x)
+            if i < len(self.convs) - 1:
+                x = F.relu(x)
         return x
 
-def load_model(model_name, in_feats, out_feats):
-    #default params
-    hidden_dim = 32
-    num_heads = 2
-    num_layers = 3
-    
+def load_model(model_name, in_feats, out_feats, num_layers=3, num_heads=2):
     if model_name == 'GCN':
+        hidden_dim = 32
         return GCNModel(in_feats, hidden_dim, out_feats, num_layers)
     elif model_name == 'GraphSAGE':
+        hidden_dim = 32
         return GraphSAGEModel(in_feats, hidden_dim, out_feats, num_layers)
     elif model_name == 'GraphGPS':
+        hidden_dim = 32
         return GraphGPSModel(in_feats, hidden_dim, out_feats, num_layers, num_heads=num_heads)
     elif model_name == 'GAT':
+        hidden_dim = 32
         return GATModel(in_feats, hidden_dim, out_feats, num_layers, num_heads=num_heads)
     else:
         raise ValueError(f"Unknown model {model_name}")
 
-############
-
+def set_seed(seed=42):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    logger.info(f"Random seed set to {seed}")
+    print(f"Random seed set to {seed}")
 
 @torch.no_grad()
-def evaluate_multilabel_ogbproteins(model, data, idx, evaluator, device):
-    if not torch.is_tensor(idx):
-        idx = torch.tensor(idx, dtype=torch.long)
-    model_cpu = model.to('cpu')
-    model_cpu.eval()
-    x_cpu = data.x.cpu()
-    edge_index_cpu = data.edge_index.cpu()
-    out = model_cpu(x_cpu, edge_index_cpu)  # [num_nodes, 112]
-    y_true = data.y[idx].cpu().float()
-    y_pred = out[idx].cpu().float()
-
+def evaluate_multilabel_ogbproteins(model, loader, device):
+    model.eval()
+    all_y_true = []
+    all_y_pred = []
+    for batch in tqdm(loader, desc="Evaluating", leave=False):
+        batch = batch.to(device)
+        out = model(batch.x, batch.edge_index)
+        y_true = batch.y.float().cpu()
+        y_pred = out.cpu()
+        all_y_true.append(y_true)
+        all_y_pred.append(y_pred)
+    y_true = torch.cat(all_y_true, dim=0)
+    y_pred = torch.cat(all_y_pred, dim=0)
+    evaluator = Evaluator(name='ogbn-proteins')
     input_dict = {"y_true": y_true, "y_pred": y_pred}
     result = evaluator.eval(input_dict)
-    model.to(device)
     return result['rocauc']
 
 def train_multilabel_ogbproteins(model, loader, optimizer, device):
@@ -143,11 +161,127 @@ def train_multilabel_ogbproteins(model, loader, optimizer, device):
         total_loss += loss.item()
         if step % 50 == 0:
             logger.info(f"  [Train Step {step}] Loss: {loss.item():.4f}")
+            print(f"  [Train Step {step}] Loss: {loss.item():.4f}")
     return total_loss / len(loader)
 
-# Node2Vec for embeddings for the proteins dataset, since it doesn't seem like they have embeddings by default
+def run_experiment(model_name, dataset_name, device, epochs=1, batch_size=512, num_neighbors=[10,5,2], hidden_dim=32, num_layers=3, num_heads=2):
+    logger.info(f"Starting Experiment: Model={model_name}, Dataset={dataset_name}")
+    print(f"\n=== Experiment: Model={model_name}, Dataset={dataset_name} ===")
+    
+    # Load dataset
+    try:
+        dataset = PygNodePropPredDataset(name=dataset_name, root='dataset/')
+        data = dataset[0]
+        logger.info(f"Dataset {dataset_name} loaded successfully.")
+        print(f"Dataset {dataset_name} loaded successfully.")
+    except Exception as e:
+        logger.error(f"Failed to load dataset {dataset_name}: {e}")
+        print(f"Failed to load dataset {dataset_name}: {e}")
+        return []
+    
+    split_idx = dataset.get_idx_split()
+    train_idx = split_idx['train'].squeeze()
+    valid_idx = split_idx['valid'].squeeze()
+    test_idx = split_idx['test'].squeeze()
+    data = data.to('cpu')
 
-def generate_node2vec_features(edge_index, num_nodes, embedding_dim=64, walk_length=20, context_size=10, walks_per_node=10, num_epochs=1):
+    # need node2vec here for proteins
+    if not hasattr(data, 'x') or data.x is None:
+        logger.info("No node features found. Generating Node2Vec embeddings.")
+        print("No node features found. Generating Node2Vec embeddings.")
+        data.x = generate_node2vec_features(data.edge_index, data.num_nodes, embedding_dim=hidden_dim)
+    else:
+        logger.info(f"Node features found with shape {data.x.shape}.")
+        print(f"Node features found with shape {data.x.shape}.")
+    
+    evaluator = Evaluator(name=dataset_name)
+    
+    try:
+        if dataset_name in ['ogbn-arxiv', 'ogbn-products']:
+            out_feats = int(data.y.max()) + 1
+        elif dataset_name == 'ogbn-proteins':
+            out_feats = data.y.size(1)  # Multi-label classification
+        else:
+            raise ValueError(f"Unsupported dataset {dataset_name}")
+        
+        model = load_model(model_name, in_feats=data.x.size(1), out_feats=out_feats, num_layers=num_layers, num_heads=num_heads)
+        model = model.to(device)
+        logger.info(f"Model {model_name} initialized and moved to device.")
+        print(f"Model {model_name} initialized and moved to device.")
+    except Exception as e:
+        logger.error(f"Failed to initialize model {model_name}: {e}")
+        print(f"Failed to initialize model {model_name}: {e}")
+        return []
+    
+    optimizer = optim.Adam(model.parameters(), lr=0.01)
+    
+    train_loader = NeighborLoader(
+        data,
+        input_nodes=train_idx,
+        num_neighbors=num_neighbors,
+        batch_size=batch_size,
+        shuffle=True
+    )
+    
+    valid_loader = NeighborLoader(
+        data,
+        input_nodes=valid_idx,
+        num_neighbors=[10,5,2],
+        batch_size=batch_size,
+        shuffle=False
+    )
+    
+    test_loader = NeighborLoader(
+        data,
+        input_nodes=test_idx,
+        num_neighbors=[10,5,2],  # Adjust as needed to manage memory
+        batch_size=batch_size,
+        shuffle=False
+    )
+    
+    logger.info("DataLoaders for train, validation, and test sets initialized.")
+    print("DataLoaders for train, validation, and test sets initialized.")
+    
+    epoch_results = []
+    for epoch in range(1, epochs + 1):
+        start_epoch = time.time()
+        loss = train_multilabel_ogbproteins(model, train_loader, optimizer, device)
+        end_epoch = time.time()
+        epoch_time = end_epoch - start_epoch
+        logger.info(f"Epoch {epoch}: Loss={loss:.4f}, Time={epoch_time:.2f}s")
+        print(f"Epoch {epoch}: Loss={loss:.4f}, Time={epoch_time:.2f}s")
+        
+        # Validation
+        val_rocauc = evaluate_multilabel_ogbproteins(model, valid_loader, device)
+        logger.info(f"Epoch {epoch}: Validation ROC-AUC={val_rocauc:.4f}")
+        print(f"Epoch {epoch}: Validation ROC-AUC={val_rocauc:.4f}")
+        
+        # Test
+        test_rocauc = evaluate_multilabel_ogbproteins(model, test_loader, device)
+        logger.info(f"Epoch {epoch}: Test ROC-AUC={test_rocauc:.4f}")
+        print(f"Epoch {epoch}: Test ROC-AUC={test_rocauc:.4f}")
+        
+        epoch_results.append({
+            'dataset': dataset_name,
+            'model': model_name,
+            'epoch': epoch,
+            'val_acc': np.nan,          # doesnt work here
+            'val_f1_macro': np.nan,     # doesnt work here
+            'test_acc': np.nan,         # doesnt work here
+            'test_f1_macro': np.nan,    # doesnt work here
+            'val_rocauc': val_rocauc,
+            'test_rocauc': test_rocauc
+        })
+    
+    logger.info(f"Completed Experiment: Model={model_name}, Dataset={dataset_name}")
+    print(f"=== Completed Experiment: Model={model_name}, Dataset={dataset_name} ===")
+    del model
+    torch.cuda.empty_cache()
+    gc.collect()
+    
+    return epoch_results
+
+def generate_node2vec_features(edge_index, num_nodes, embedding_dim=32, walk_length=20, context_size=10, walks_per_node=10, num_epochs=1):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     node2vec = Node2Vec(edge_index, embedding_dim=embedding_dim, walk_length=walk_length,
                         context_size=context_size, walks_per_node=walks_per_node,
@@ -164,87 +298,80 @@ def generate_node2vec_features(edge_index, num_nodes, embedding_dim=64, walk_len
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        logger.info(f"Node2Vec Epoch {epoch+1}, Loss: {total_loss:.4f}")
+        logger.info(f"Node2Vec Epoch {epoch+1},Loss: {total_loss:.4f}")
+        print(f"Node2Vec Epoch {epoch+1}, Loss: {total_loss:.4f}")
 
     node2vec.eval()
-    embeddings = node2vec(torch.arange(num_nodes, device=device)).detach().cpu()  # detach to avoid graph references
+    embeddings = node2vec(torch.arange(num_nodes, device=device)).detach().cpu()
+    print(f"Node2Vec embeddings generated with shape {embeddings.shape}")
+    logger.info(f"Node2Vec embeddings generated with shape {embeddings.shape}")
     return embeddings
 
+def main():
+    parser = argparse.ArgumentParser(description="Benchmark GNN Models on OGB Datasets")
+    parser.add_argument('--models', nargs='+', default=['GCN', 'GraphSAGE', 'GraphGPS', 'GAT'],
+                        help="List of models to benchmark")
+    parser.add_argument('--datasets', nargs='+', default=['ogbn-proteins'],
+                        help="List of OGB datasets to use")
+    parser.add_argument('--epochs', type=int, default=1,
+                        help="Number of training epochs")
+    parser.add_argument('--batch_size', type=int, default=512,
+                        help="Batch size for training")
+    parser.add_argument('--hidden_dim', type=int, default=32,
+                        help="Hidden dimension size")
+    parser.add_argument('--num_layers', type=int, default=3,
+                        help="Number of GNN layers")
+    parser.add_argument('--num_heads', type=int, default=2,
+                        help="Number of attention heads for GraphGPS and GAT")
+    parser.add_argument('--num_neighbors', nargs='+', type=int, default=[10,5,2],
+                        help="Number of neighbors to sample at each layer for NeighborLoader")
+    parser.add_argument('--output', type=str, default='benchmark_results.csv',
+                        help="Output CSV file for results")
+    args = parser.parse_args()
+
+    set_seed(1)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    logger.info(f"Using device: {device}")
+    
+    all_epoch_results = []
+    for dataset_name in args.datasets:
+        for model_name in args.models:
+            current_epochs = args.epochs
+            # Adjust epochs based on dataset if needed
+            if dataset_name == 'ogbn-products':
+                current_epochs = 2  # Example adjustment
+            
+            epoch_results = run_experiment(
+                model_name=model_name,
+                dataset_name=dataset_name,
+                device=device,
+                epochs=current_epochs,
+                batch_size=args.batch_size,
+                num_neighbors=args.num_neighbors,
+                hidden_dim=args.hidden_dim,
+                num_layers=args.num_layers,
+                num_heads=args.num_heads
+            )
+            if epoch_results:
+                all_epoch_results.extend(epoch_results)
+    
+    if all_epoch_results:
+        results_df = pd.DataFrame(all_epoch_results)
+        desired_columns = ['dataset', 'model', 'epoch', 'val_acc', 'val_f1_macro', 'test_acc', 'test_f1_macro', 'val_rocauc', 'test_rocauc']
+        for col in desired_columns:
+            if col not in results_df.columns:
+                results_df[col] = np.nan
+        results_df = results_df[desired_columns]
+        if not os.path.exists(args.output):
+            results_df.to_csv(args.output, index=False)
+        else:
+            results_df.to_csv(args.output, mode='a', index=False, header=False)
+        print(f"\nBenchmarking completed! Results saved to {args.output}")
+        logger.info(f"Benchmarking completed! Results saved to {args.output}")
+    else:
+        print("\nNo experiments were completed successfully.")
+        logger.warning("No experiments were completed successfully.")
 
 if __name__ == "__main__":
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"Running on device: {device}")
-
-    d_name = 'ogbn-proteins'
-    models = ['GCN', 'GraphSAGE', 'GraphGPS', 'GAT']  # Replaced 'DRew' with 'GAT'
-    current_epochs = 1
-
-    results_csv = "benchmark_results.csv"
-    file_exists = os.path.exists(results_csv)
-    results = []
-
-    logger.info(f"=== Loading dataset: {d_name} ===")
-    dataset = PygNodePropPredDataset(name=d_name)
-    split_idx = dataset.get_idx_split()
-    train_idx, valid_idx, test_idx = split_idx["train"], split_idx["valid"], split_idx["test"]
-    data = dataset[0]
-
-    edge_index = data.edge_index
-    num_nodes = data.num_nodes
-    logger.info("Generating Node2Vec embeddings...")
-    embeddings = generate_node2vec_features(edge_index, num_nodes, embedding_dim=64, num_epochs=1)
-    data.x = embeddings  # embeddings are detached, no gradient
-
-    evaluator = Evaluator(name='ogbn-proteins')
-
-    logger.info(f"Number of nodes: {data.x.size(0)}")
-    logger.info(f"Number of features: {data.x.size(1)}")
-    logger.info(f"Number of edges: {data.edge_index.size(1)}")
-    logger.info(f"Number of tasks (labels): {data.y.size(1)}") 
-    logger.info(f"Train/Valid/Test split sizes: {len(train_idx)}, {len(valid_idx)}, {len(test_idx)}")
-
-    neighbor_sizes =  [10, 5, 2]
-    batch_size = 512
-
-    logger.info("Creating NeighborLoader for training...")
-    train_loader = NeighborLoader(
-        data,
-        input_nodes=train_idx,
-        num_neighbors=neighbor_sizes,
-        batch_size=batch_size,
-        shuffle=True
-    )
-
-    data = data.to('cpu')
-    out_dim = data.y.size(1)  # 112 classes
-
-    for model_name in models:
-        logger.info(f"=== Training Model: {model_name} on {d_name} ===")
-        model = load_model(model_name, data.x.size(-1), out_dim)
-        model.to(device)
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
-
-        best_val_metric = -1
-        for epoch in range(1, current_epochs+1):
-            logger.info(f"[Epoch {epoch}]")
-            loss = train_multilabel_ogbproteins(model, train_loader, optimizer, device)
-            val_rocauc = evaluate_multilabel_ogbproteins(model, data, valid_idx, evaluator, device)
-            logger.info(f"  Epoch {epoch}: Loss={loss:.4f}, Val_ROC-AUC={val_rocauc:.4f}")
-            if val_rocauc > best_val_metric:
-                best_val_metric = val_rocauc
-                test_rocauc = evaluate_multilabel_ogbproteins(model, data, test_idx, evaluator, device)
-                results.append({
-                    'dataset': d_name,
-                    'model': model_name,
-                    'epoch': epoch,
-                    'val_rocauc': val_rocauc,
-                    'test_rocauc': test_rocauc
-                })
-
-
-        logger.info(f"=== Finished Training Model: {model_name} on {d_name} ===")
-
-    results_df = pd.DataFrame(results)
-    results_df.to_csv(results_csv, mode='a', index=False, header=not file_exists)
-
-    logger.info("All experiments completed.")
+    main()
